@@ -1,15 +1,17 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <queue>
 #include <pthread.h>
-#include <signal.h>
 #include <dlfcn.h>
-#include <cstring>
+#include <ctime>
+#include <sys/stat.h>
 #include <unistd.h>
+#include <cstdio>
+#include <csignal>
+#include <sys/stat.h>
+#include <libgen.h>
 
 #define BLOCK_SIZE 8192
-#define MAX_BLOCKS 4   // ограничение очереди
 
 volatile sig_atomic_t keep_running = 1;
 
@@ -18,100 +20,121 @@ void handle_sigint(int)
     keep_running = 0;
 }
 
+int file_count;
+char** files;
+char* output_dir;
+char key;
+int current_index = 0;
+int copied_count = 0;
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+
 typedef void (*set_key_func)(char);
 typedef void (*caesar_func)(void*, void*, int);
 
-// Общая очередь (но НЕ глобальная!)
-struct SharedQueue {
-    std::queue<std::vector<char>> queue;
-    bool finished = false;
-
-    pthread_mutex_t mutex;
-    pthread_cond_t not_empty;
-    pthread_cond_t not_full;
-};
-
 struct ThreadArgs {
-    std::ifstream* in;
-    std::ofstream* out;
     set_key_func set_key;
     caesar_func caesar;
-    char key;
-    SharedQueue* shared;
 };
 
-void* producer(void* arg)
+void log_action(const std::string& filename, const std::string& status)
 {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    std::vector<char> buffer(BLOCK_SIZE);
+    pthread_mutex_lock(&mutex);
 
-    args->set_key(args->key);
-
-    while (keep_running)
+    FILE* log = fopen("log.txt", "a");
+    if (log)
     {
-        args->in->read(buffer.data(), BLOCK_SIZE);
-        std::streamsize bytes = args->in->gcount();
+        time_t now = time(nullptr);
+        char timebuf[64];
+        strftime(timebuf, sizeof(timebuf),
+                 "%Y-%m-%d %H:%M:%S",
+                 localtime(&now));
 
-        if (bytes <= 0)
-            break;
+        pid_t pid = getpid();
+        pthread_t tid = pthread_self();
 
-        args->caesar(buffer.data(), buffer.data(), bytes);
+        fprintf(log, "%s (%d %lu) %s %s\n",
+                timebuf, pid, tid,
+                filename.c_str(),
+                status.c_str());
 
-        std::vector<char> block(buffer.begin(), buffer.begin() + bytes);
-
-        pthread_mutex_lock(&args->shared->mutex);
-
-        while (args->shared->queue.size() >= MAX_BLOCKS && keep_running)
-            pthread_cond_wait(&args->shared->not_full,
-                              &args->shared->mutex);
-
-        args->shared->queue.push(block);
-
-        pthread_cond_signal(&args->shared->not_empty);
-        pthread_mutex_unlock(&args->shared->mutex);
+        fclose(log);
     }
 
-    pthread_mutex_lock(&args->shared->mutex);
-    args->shared->finished = true;
-    pthread_cond_signal(&args->shared->not_empty);
-    pthread_mutex_unlock(&args->shared->mutex);
-
-    return nullptr;
+    pthread_mutex_unlock(&mutex);
 }
 
-void* consumer(void* arg)
+void* worker(void* arg)
 {
     ThreadArgs* args = (ThreadArgs*)arg;
+    args->set_key(key);
 
     while (keep_running)
     {
-        pthread_mutex_lock(&args->shared->mutex);
+        timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 5;
 
-        while (args->shared->queue.empty() &&
-               !args->shared->finished &&
-               keep_running)
+        if (pthread_mutex_timedlock(&mutex, &ts) == ETIMEDOUT)
         {
-            pthread_cond_wait(&args->shared->not_empty,
-                              &args->shared->mutex);
+            std::cout << "Deadlock warning: thread "
+                      << pthread_self() << " waited >5 sec\n";
+            continue;
         }
 
-        if (!args->shared->queue.empty())
+        if (current_index >= file_count)
         {
-            std::vector<char> block =
-                args->shared->queue.front();
-
-            args->shared->queue.pop();
-
-            pthread_cond_signal(&args->shared->not_full);
-            pthread_mutex_unlock(&args->shared->mutex);
-
-            args->out->write(block.data(), block.size());
-        }
-        else
-        {
-            pthread_mutex_unlock(&args->shared->mutex);
+            pthread_mutex_unlock(&mutex);
             break;
         }
+
+        int index = current_index++;
+        pthread_mutex_unlock(&mutex);
+
+        char* filename = files[index];
+
+        struct stat st;
+        if (stat(filename, &st) != 0 || S_ISDIR(st.st_mode)) {
+            std::cerr << "Skipping non-file: " << filename << "\n";
+            continue;
+        }
+
+        std::ifstream in(filename, std::ios::binary);
+        if (!in)
+        {
+            log_action(filename, "ERROR");
+            continue;
+        }
+        
+        char* base = basename(filename);
+        std::string out_path = std::string(output_dir) + "/" + base;
+        //std::string out_path = std::string(output_dir) + "/" + basename(filename);
+        std::ofstream out(out_path, std::ios::binary);
+        if (!out)
+        {
+            log_action(filename, "ERROR");
+            in.close();
+            continue;
+        }
+
+        std::vector<char> buffer(BLOCK_SIZE);
+        while (in)
+        {
+            in.read(buffer.data(), BLOCK_SIZE);
+            std::streamsize bytes = in.gcount();
+            if (bytes <= 0) break;
+
+            args->caesar(buffer.data(), buffer.data(), bytes);
+            out.write(buffer.data(), bytes);
+        }
+
+        in.close();
+        out.close();
+
+        log_action(filename, "SUCCESS");
+
+        pthread_mutex_lock(&mutex);
+        copied_count++;
+        pthread_mutex_unlock(&mutex);
     }
 
     return nullptr;
@@ -119,27 +142,20 @@ void* consumer(void* arg)
 
 int main(int argc, char* argv[])
 {
-    if (argc != 4)
+    if (argc < 4)
     {
-        std::cout << "Usage: ./secure_copy <src> <dst> <key>\n";
+        std::cout << "Usage: ./secure_copy file1 [file2 ...] output_dir key\n";
         return 1;
     }
 
     signal(SIGINT, handle_sigint);
 
-    std::ifstream in(argv[1], std::ios::binary);
-    if (!in)
-    {
-        std::cerr << "Source file not found\n";
-        return 1;
-    }
+    key = argv[argc - 1][0];
+    output_dir = argv[argc - 2];
+    file_count = argc - 3;       
+    files = &argv[1];
 
-    std::ofstream out(argv[2], std::ios::binary);
-    if (!out)
-    {
-        std::cerr << "Cannot open destination file\n";
-        return 1;
-    }
+    mkdir(output_dir, 0777);
 
     void* handle = dlopen("./libcaesar.so", RTLD_LAZY);
     if (!handle)
@@ -148,57 +164,30 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    set_key_func set_key =
-        (set_key_func)dlsym(handle, "set_key");
-    caesar_func caesar =
-        (caesar_func)dlsym(handle, "caesar");
+    set_key_func set_key = (set_key_func)dlsym(handle, "set_key");
+    caesar_func caesar = (caesar_func)dlsym(handle, "caesar");
 
     if (!set_key || !caesar)
     {
-        std::cerr << "Cannot load functions\n";
+        std::cerr << "Cannot load functions from libcaesar.so\n";
         dlclose(handle);
         return 1;
     }
 
-    SharedQueue shared;
-    pthread_mutex_init(&shared.mutex, nullptr);
-    pthread_cond_init(&shared.not_empty, nullptr);
-    pthread_cond_init(&shared.not_full, nullptr);
-
     ThreadArgs args;
-    args.in = &in;
-    args.out = &out;
     args.set_key = set_key;
     args.caesar = caesar;
-    args.key = argv[3][0];
-    args.shared = &shared;
 
-    pthread_t prod, cons;
+    pthread_t threads[3];
+    for (int i = 0; i < 3; i++)
+        pthread_create(&threads[i], nullptr, worker, &args);
 
-    pthread_create(&prod, nullptr, producer, &args);
-    pthread_create(&cons, nullptr, consumer, &args);
-
-    pthread_join(prod, nullptr);
-    pthread_join(cons, nullptr);
-
-    pthread_mutex_destroy(&shared.mutex);
-    pthread_cond_destroy(&shared.not_empty);
-    pthread_cond_destroy(&shared.not_full);
+    for (int i = 0; i < 3; i++)
+        pthread_join(threads[i], nullptr);
 
     dlclose(handle);
 
-    in.close();
-    out.close();
-
-    if (!keep_running)
-    {
-        std::cout << "Операция прервана пользователем\n";
-        remove(argv[2]);  // удаляем частичный файл
-    }
-    else
-    {
-        std::cout << "Готово\n";
-    }
+    std::cout << "All files processed. Total copied: " << copied_count << "\n";
 
     return 0;
 }
