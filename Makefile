@@ -1,32 +1,28 @@
-CXX = g++
-CXXFLAGS = -Wall -Wextra -pedantic -fPIC
-LDFLAGS = -ldl
+CC = g++
+CFLAGS = -Wall -Wextra -pedantic -pthread
 
-LIB = libcaesar.so
-EXE = test
+all: libcaesar.so secure_copy
 
-LIB_SRC = caesar.cpp
-EXE_SRC = test.cpp
+# Сборка динамической библиотеки
+libcaesar.so: caesar.cpp
+	$(CC) -shared -fPIC -o $@ $^
 
-.PHONY: all install runtest clean
+# Сборка основной программы
+secure_copy: secure_copy.cpp
+	$(CC) $(CFLAGS) -o $@ $^ -ldl
 
-all: $(LIB) $(EXE)
-
-$(LIB): $(LIB_SRC)
-	$(CXX) $(CXXFLAGS) -shared -o $(LIB) $(LIB_SRC)
-
-$(EXE): $(EXE_SRC)
-	$(CXX) $(CXXFLAGS) -o $(EXE) $(EXE_SRC) $(LDFLAGS)
-
+# Установка библиотеки
 install:
-	sudo cp $(LIB) /usr/local/lib/
+	sudo cp libcaesar.so /usr/local/lib/
 	sudo ldconfig
 
-runtest: all
-	echo "HelloWorld" > input.txt
-	./$(EXE) ./$(LIB) A input.txt encrypted.txt
-	./$(EXE) ./$(LIB) A encrypted.txt restored.txt
-	diff input.txt restored.txt && echo "Test passed"
+# Тест
+test: all
+	@echo "=== Test ==="
+	./secure_copy test_files/file1.txt test_files/file2.txt test_files/file3.txt output_test 42
 
 clean:
-	rm -f $(LIB) $(EXE) *.txt
+	rm -f libcaesar.so secure_copy *.o *.txt
+	rm -rf output_* output_test
+
+.PHONY: all clean install test
