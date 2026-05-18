@@ -14,12 +14,15 @@
 #define BLOCK_SIZE 8192
 #define MAX_WORKERS 4
 
+// Режимы работы
 enum Mode { AUTO, SEQUENTIAL, PARALLEL };
 Mode current_mode = AUTO;
 
 volatile sig_atomic_t keep_running = 1;
 
-void handle_sigint(int) { keep_running = 0; }
+void handle_sigint(int) {
+    keep_running = 0;
+}
 
 // Глобальные переменные
 int file_count = 0;
@@ -46,6 +49,7 @@ struct FileStats {
 };
 std::vector<FileStats> all_stats;
 
+// Логирование
 void log_action(const std::string& filename, const std::string& status) {
     pthread_mutex_lock(&mutex);
     FILE* log = fopen("log.txt", "a");
@@ -53,13 +57,18 @@ void log_action(const std::string& filename, const std::string& status) {
         time_t now = time(nullptr);
         char timebuf[64];
         strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
-        fprintf(log, "%s (%d %lu) %s %s\n", timebuf, getpid(), (unsigned long)pthread_self(), filename.c_str(), status.c_str());
+        fprintf(log, "%s (%d %lu) %s %s\n", 
+                timebuf, getpid(), (unsigned long)pthread_self(), 
+                filename.c_str(), status.c_str());
         fclose(log);
     }
     pthread_mutex_unlock(&mutex);
 }
 
-double process_file(const char* filename, const char* out_dir, set_key_func set_key, caesar_func caesar_func, char key_char) {
+// Обработка одного файла
+double process_file(const char* filename, const char* out_dir, 
+                   set_key_func set_key, caesar_func caesar_func, char key_char) {
+    
     if (std::string(filename).rfind("--mode=", 0) == 0) {
         std::cout << "Skipping non-file: " << filename << std::endl;
         return 0.0;
@@ -67,6 +76,7 @@ double process_file(const char* filename, const char* out_dir, set_key_func set_
 
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
+
     set_key(key_char);
 
     struct stat st;
@@ -80,6 +90,7 @@ double process_file(const char* filename, const char* out_dir, set_key_func set_
 
     std::ifstream in(filename, std::ios::binary);
     std::ofstream out(out_path, std::ios::binary);
+
     if (!in || !out) {
         log_action(filename, "ERROR");
         return 0.0;
@@ -99,7 +110,8 @@ double process_file(const char* filename, const char* out_dir, set_key_func set_
     log_action(filename, "SUCCESS");
 
     clock_gettime(CLOCK_MONOTONIC, &end);
-    double time_ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+    double time_ms = (end.tv_sec - start.tv_sec) * 1000.0 + 
+                     (end.tv_nsec - start.tv_nsec) / 1000000.0;
 
     pthread_mutex_lock(&stats_mutex);
     all_stats.push_back({filename, time_ms});
@@ -108,6 +120,7 @@ double process_file(const char* filename, const char* out_dir, set_key_func set_
     return time_ms;
 }
 
+// Рабочий поток
 void* parallel_worker(void* arg) {
     ThreadArgs* args = (ThreadArgs*)arg;
     while (keep_running) {
@@ -132,7 +145,7 @@ void* parallel_worker(void* arg) {
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cout << "Usage:\n"
-                  << "  ./secure_copy [--mode=sequential|parallel] file1 [file2 ...] output_dir key\n";
+                  << " ./secure_copy [--mode=sequential|parallel] file1 [file2 ...] output_dir key\n";
         return 1;
     }
 
@@ -141,6 +154,7 @@ int main(int argc, char* argv[]) {
     int files_start = 1;
     current_mode = AUTO;
 
+    // Парсинг режима
     if (argc > 1 && std::string(argv[1]).rfind("--mode=", 0) == 0) {
         std::string m = argv[1];
         if (m == "--mode=sequential") current_mode = SEQUENTIAL;
@@ -163,13 +177,19 @@ int main(int argc, char* argv[]) {
 
     files = &argv[files_start];
 
-    std::cout << "Mode: " << (current_mode == SEQUENTIAL ? "SEQUENTIAL" : current_mode == PARALLEL ? "PARALLEL" : "AUTO") 
+    std::cout << "Mode: " 
+              << (current_mode == SEQUENTIAL ? "SEQUENTIAL" : 
+                 (current_mode == PARALLEL ? "PARALLEL" : "AUTO"))
               << " | Files: " << file_count << std::endl;
 
     mkdir(output_dir, 0777);
 
+    // Загрузка библиотеки
     void* handle = dlopen("./libcaesar.so", RTLD_LAZY);
-    if (!handle) { std::cerr << "dlopen failed\n"; return 1; }
+    if (!handle) { 
+        std::cerr << "dlopen failed\n"; 
+        return 1; 
+    }
 
     auto set_key = (set_key_func)dlsym(handle, "set_key");
     auto caesar_f = (caesar_func)dlsym(handle, "caesar");
@@ -188,6 +208,7 @@ int main(int argc, char* argv[]) {
     current_index = 0;
     copied_count = 0;
 
+    // Выбор режима
     if (current_mode == SEQUENTIAL || (current_mode == AUTO && file_count < 5)) {
         std::cout << "[SEQUENTIAL MODE]\n";
         for (int i = 0; i < file_count && keep_running; ++i) {
@@ -204,15 +225,19 @@ int main(int argc, char* argv[]) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &total_end);
-    double total_time = (total_end.tv_sec - total_start.tv_sec)*1000.0 + (total_end.tv_nsec - total_start.tv_nsec)/1000000.0;
+    double total_time = (total_end.tv_sec - total_start.tv_sec)*1000.0 + 
+                        (total_end.tv_nsec - total_start.tv_nsec)/1000000.0;
 
     // Статистика
     std::cout << "\n=== STATISTICS ===\n";
-    
+   
     std::string mode_str;
-    if (current_mode == SEQUENTIAL) mode_str = "SEQUENTIAL";
-    else if (current_mode == PARALLEL) mode_str = "PARALLEL";
-    else mode_str = "AUTO (SEQUENTIAL)";
+    if (current_mode == SEQUENTIAL) 
+        mode_str = "SEQUENTIAL";
+    else if (current_mode == PARALLEL) 
+        mode_str = "PARALLEL";
+    else 
+        mode_str = (file_count < 5 ? "AUTO (SEQUENTIAL)" : "AUTO (PARALLEL)");
 
     std::cout << "Mode: " << mode_str << "\n";
     std::cout << "Files processed: " << copied_count << " / " << file_count << "\n";
