@@ -10,9 +10,19 @@
 #include <csignal>
 #include <libgen.h>
 #include <iomanip>
+#include <sys/mman.h>
+#include <errno.h>
+#include <cstring>
 
 #define BLOCK_SIZE 8192
 #define MAX_WORKERS 4
+
+// Прототипы функций для защищённой памяти
+bool init_secure_key();
+bool set_secure_key(char key_char);
+char get_secure_key();
+void cleanup_secure_key();
+
 
 // Режимы работы
 enum Mode { AUTO, SEQUENTIAL, PARALLEL };
@@ -23,6 +33,69 @@ volatile sig_atomic_t keep_running = 1;
 void handle_sigint(int) {
     keep_running = 0;
 }
+
+// Защищённая память для ключа
+void* secure_key_mem = nullptr;
+const size_t KEY_SIZE = 16;
+
+// Инициализация защищённой памяти под ключ
+bool init_secure_key() {
+    secure_key_mem = mmap(NULL, KEY_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (secure_key_mem == MAP_FAILED) {
+        std::cerr << "mmap failed: " << strerror(errno) << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Установка ключа в защищённую память
+bool set_secure_key(char key_char) {
+    if (!secure_key_mem) return false;
+
+    if (mprotect(secure_key_mem, KEY_SIZE, PROT_READ | PROT_WRITE) != 0) {
+        std::cerr << "mprotect (RW) failed\n";
+        return false;
+    }
+
+    memcpy(secure_key_mem, &key_char, 1);
+
+    if (mprotect(secure_key_mem, KEY_SIZE, PROT_READ) != 0) {
+        std::cerr << "mprotect (RO) failed\n";
+        return false;
+    }
+    return true;
+}
+
+// Получение копии ключа для использования
+char get_secure_key() {
+    if (!secure_key_mem) return 0;
+
+    mprotect(secure_key_mem, KEY_SIZE, PROT_READ | PROT_WRITE);
+    char k = ((char*)secure_key_mem)[0];
+    mprotect(secure_key_mem, KEY_SIZE, PROT_READ);
+    return k;
+}
+
+// Очистка защищённой памяти
+void cleanup_secure_key() {
+    if (secure_key_mem) {
+        mprotect(secure_key_mem, KEY_SIZE, PROT_READ | PROT_WRITE);
+        memset(secure_key_mem, 0, KEY_SIZE);
+        munmap(secure_key_mem, KEY_SIZE);
+        secure_key_mem = nullptr;
+    }
+}
+
+// Теперь обработчик может использовать cleanup_secure_key()
+void segfault_handler(int /*sig*/, siginfo_t* info, void* /*ucontext*/) {
+    std::cerr << "\n[SECURITY ERROR] Segmentation fault! Attempted write to protected key memory.\n";
+    std::cerr << "Address: " << info->si_addr << std::endl;
+    cleanup_secure_key();
+    exit(2);
+}
+
+
 
 // Глобальные переменные
 int file_count = 0;
@@ -57,8 +130,8 @@ void log_action(const std::string& filename, const std::string& status) {
         time_t now = time(nullptr);
         char timebuf[64];
         strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
-        fprintf(log, "%s (%d %lu) %s %s\n", 
-                timebuf, getpid(), (unsigned long)pthread_self(), 
+        fprintf(log, "%s (%d %lu) %s %s\n",
+                timebuf, getpid(), (unsigned long)pthread_self(),
                 filename.c_str(), status.c_str());
         fclose(log);
     }
@@ -66,8 +139,8 @@ void log_action(const std::string& filename, const std::string& status) {
 }
 
 // Обработка одного файла
-double process_file(const char* filename, const char* out_dir, 
-                   set_key_func set_key, caesar_func caesar_func, char key_char) {
+double process_file(const char* filename, const char* out_dir,
+                   set_key_func set_key, caesar_func caesar_func, char /*key_char*/) {
     
     if (std::string(filename).rfind("--mode=", 0) == 0) {
         std::cout << "Skipping non-file: " << filename << std::endl;
@@ -77,7 +150,7 @@ double process_file(const char* filename, const char* out_dir,
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
-    set_key(key_char);
+    set_key(get_secure_key());   // используем защищённый ключ
 
     struct stat st;
     if (stat(filename, &st) != 0 || S_ISDIR(st.st_mode)) {
@@ -110,7 +183,7 @@ double process_file(const char* filename, const char* out_dir,
     log_action(filename, "SUCCESS");
 
     clock_gettime(CLOCK_MONOTONIC, &end);
-    double time_ms = (end.tv_sec - start.tv_sec) * 1000.0 + 
+    double time_ms = (end.tv_sec - start.tv_sec) * 1000.0 +
                      (end.tv_nsec - start.tv_nsec) / 1000000.0;
 
     pthread_mutex_lock(&stats_mutex);
@@ -142,6 +215,9 @@ void* parallel_worker(void* arg) {
     return nullptr;
 }
 
+
+
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cout << "Usage:\n"
@@ -150,6 +226,13 @@ int main(int argc, char* argv[]) {
     }
 
     signal(SIGINT, handle_sigint);
+
+    // Установка обработчика SIGSEGV
+    struct sigaction sa = {};
+    sa.sa_sigaction = segfault_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
 
     int files_start = 1;
     current_mode = AUTO;
@@ -177,8 +260,8 @@ int main(int argc, char* argv[]) {
 
     files = &argv[files_start];
 
-    std::cout << "Mode: " 
-              << (current_mode == SEQUENTIAL ? "SEQUENTIAL" : 
+    std::cout << "Mode: "
+              << (current_mode == SEQUENTIAL ? "SEQUENTIAL" :
                  (current_mode == PARALLEL ? "PARALLEL" : "AUTO"))
               << " | Files: " << file_count << std::endl;
 
@@ -186,9 +269,9 @@ int main(int argc, char* argv[]) {
 
     // Загрузка библиотеки
     void* handle = dlopen("./libcaesar.so", RTLD_LAZY);
-    if (!handle) { 
-        std::cerr << "dlopen failed\n"; 
-        return 1; 
+    if (!handle) {
+        std::cerr << "dlopen failed\n";
+        return 1;
     }
 
     auto set_key = (set_key_func)dlsym(handle, "set_key");
@@ -201,6 +284,15 @@ int main(int argc, char* argv[]) {
     }
 
     ThreadArgs args = {set_key, caesar_f};
+
+    // Инициализация защищённого ключа
+    if (!init_secure_key() || !set_secure_key(key)) {
+        std::cerr << "Failed to initialize secure key\n";
+        dlclose(handle);
+        return 1;
+    }
+    key = 0;
+    //((char*)secure_key_mem)[0] = 'X';
 
     struct timespec total_start, total_end;
     clock_gettime(CLOCK_MONOTONIC, &total_start);
@@ -225,18 +317,18 @@ int main(int argc, char* argv[]) {
     }
 
     clock_gettime(CLOCK_MONOTONIC, &total_end);
-    double total_time = (total_end.tv_sec - total_start.tv_sec)*1000.0 + 
+    double total_time = (total_end.tv_sec - total_start.tv_sec)*1000.0 +
                         (total_end.tv_nsec - total_start.tv_nsec)/1000000.0;
 
     // Статистика
     std::cout << "\n=== STATISTICS ===\n";
-   
+ 
     std::string mode_str;
-    if (current_mode == SEQUENTIAL) 
+    if (current_mode == SEQUENTIAL)
         mode_str = "SEQUENTIAL";
-    else if (current_mode == PARALLEL) 
+    else if (current_mode == PARALLEL)
         mode_str = "PARALLEL";
-    else 
+    else
         mode_str = (file_count < 5 ? "AUTO (SEQUENTIAL)" : "AUTO (PARALLEL)");
 
     std::cout << "Mode: " << mode_str << "\n";
@@ -245,6 +337,8 @@ int main(int argc, char* argv[]) {
     if (copied_count > 0)
         std::cout << "Avg time per file: " << (total_time / copied_count) << " ms\n";
 
+    // Очистка защищённой памяти
+    cleanup_secure_key();
     dlclose(handle);
     return 0;
 }
