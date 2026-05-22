@@ -13,9 +13,17 @@
 #include <sys/mman.h>
 #include <errno.h>
 #include <cstring>
+#include <dirent.h>
+#include <sys/types.h>
+#include <random>
+#include <string>
+#include <filesystem>
+#include <thread>
+#include <mutex>
+#include <algorithm>
 
 #define BLOCK_SIZE 8192
-#define MAX_WORKERS 4
+#define MAX_WORKERS 5
 
 // Прототипы функций для защищённой памяти
 bool init_secure_key();
@@ -23,6 +31,14 @@ bool set_secure_key(char key_char);
 char get_secure_key();
 void cleanup_secure_key();
 
+//прототипы для 6
+void collect_files(const std::string& path, const std::string& base_dir, std::vector<std::pair<std::string,std::string>>& files);
+
+void add_file_to_image(std::ofstream& img, const std::string& real_path, const std::string& stored_name, const std::string& master_key);
+void handle_add(int argc, char* argv[]);
+void handle_list(const std::string& image_path);
+void handle_get(int argc, char* argv[]);
+int handle_secure_container_mode(int argc, char* argv[]);
 
 // Режимы работы
 enum Mode { AUTO, SEQUENTIAL, PARALLEL };
@@ -96,6 +112,15 @@ void segfault_handler(int /*sig*/, siginfo_t* info, void* /*ucontext*/) {
 }
 
 
+typedef void (*set_key_func)(char);
+typedef void (*caesar_func)(void*, void*, int);
+
+typedef void (*rc4_init_func)(void*, const unsigned char*, int);
+typedef void (*rc4_crypt_func)(void*, const unsigned char*, unsigned char*, int);
+typedef void (*rc4_cleanup_func)(void*);
+
+
+
 
 // Глобальные переменные
 int file_count = 0;
@@ -105,11 +130,27 @@ char key = 0;
 int current_index = 0;
 int copied_count = 0;
 
+//volatile int keep_running = 1;
+void* lib_handle = nullptr;
+set_key_func p_set_key = nullptr;
+caesar_func p_caesar = nullptr;
+std::mutex image_mutex;
+
+// RC4 указатели
+rc4_init_func p_rc4_init = nullptr;
+rc4_crypt_func p_rc4_crypt = nullptr;
+rc4_cleanup_func p_rc4_cleanup = nullptr;
+
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-typedef void (*set_key_func)(char);
-typedef void (*caesar_func)(void*, void*, int);
+
+
+
+struct RC4_State {
+    unsigned char S[256];
+    int i, j;
+};
 
 struct ThreadArgs {
     set_key_func set_key;
@@ -219,12 +260,22 @@ void* parallel_worker(void* arg) {
 
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::cout << "Usage:\n"
-                  << " ./secure_copy [--mode=sequential|parallel] file1 [file2 ...] output_dir key\n";
+    if (argc < 2) {
+        std::cout << "Использование:\n"
+                  << "  Старый режим: ./secure_copy [files...] output_dir key\n"
+                  << "  Новый режим (задание 6):\n"
+                  << "    ./secure_copy -add -key \"secret\" -image disk.img file1 dir1/\n"
+                  << "    ./secure_copy -list -image disk.img\n"
+                  << "    ./secure_copy -get -key \"secret\" -image disk.img -out out.txt file_name\n";
         return 1;
     }
 
+    std::string first_arg = argv[1];
+    if (first_arg == "-add" || first_arg == "-list" || first_arg == "-get") {
+        return handle_secure_container_mode(argc, argv);  
+    }
+    
+    //old
     signal(SIGINT, handle_sigint);
 
     // Установка обработчика SIGSEGV
@@ -342,3 +393,369 @@ int main(int argc, char* argv[]) {
     dlclose(handle);
     return 0;
 }
+
+
+
+
+
+
+
+
+// Рекурсивный сбор файлов
+void collect_files(const std::string& path,
+                   const std::string& base_dir,
+                   std::vector<std::pair<std::string,std::string>>& files)
+{
+    namespace fs = std::filesystem;
+
+    try {
+        if (fs::is_regular_file(path)) {
+
+            std::string relative =
+                fs::relative(path, base_dir).string();
+
+            files.push_back({path, relative});
+            return;
+        }
+
+        if (fs::is_directory(path)) {
+
+            for (const auto& entry :
+                 fs::recursive_directory_iterator(path)) {
+
+                if (entry.is_regular_file()) {
+
+                    std::string relative =
+                        fs::relative(entry.path(), base_dir).string();
+
+                    files.push_back({
+                        entry.path().string(),
+                        relative
+                    });
+                }
+            }
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "Ошибка обхода: "
+                  << e.what() << std::endl;
+    }
+}
+
+
+// Запись одного файла в образ
+void add_file_to_image(std::ofstream& img, const std::string& real_path, const std::string& stored_name,const std::string& master_key) {
+    std::ifstream file(real_path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        std::cerr << "Ошибка открытия: " << real_path << std::endl;
+        return;
+    }
+
+    std::streamsize size = file.tellg();
+
+    if (size < 0) {
+        std::cerr << "Ошибка размера файла: " << real_path << std::endl;
+        return;
+    }
+
+    file.seekg(0, std::ios::beg);
+
+    std::vector<char> data(size);
+    file.read(data.data(), size);
+
+    // Генерация соли
+    unsigned char salt[16] = {0};
+    std::random_device rd;
+    for (int i = 0; i < 16; i++) salt[i] = rd() % 256;
+
+    // Ключ = master_key + salt
+
+    std::string full_key = master_key;
+    full_key.append(reinterpret_cast<char*>(salt), 16);
+
+    RC4_State state;
+    p_rc4_init(&state, (const unsigned char*)full_key.data(), full_key.size());
+
+    std::vector<unsigned char> encrypted(size);
+    p_rc4_crypt(&state, (const unsigned char*)data.data(), encrypted.data(), size);
+    p_rc4_cleanup(&state);
+
+    // Запись блока
+    uint32_t len_data = static_cast<uint32_t>(size);
+    uint32_t len_name = static_cast<uint32_t>(stored_name.length());
+
+    img.write(reinterpret_cast<char*>(&len_data), 4);
+    img.write(reinterpret_cast<char*>(&len_name), 4);
+    img.write(reinterpret_cast<char*>(salt), 16);
+    img.write(stored_name.c_str(), len_name);
+    img.write(reinterpret_cast<char*>(encrypted.data()), size);
+}
+
+
+
+// Поточная функция
+void threaded_add(
+    const std::string& image_path,
+    const std::string& real_path,
+    const std::string& stored_name,
+    const std::string& key)
+{
+    std::lock_guard<std::mutex> lock(image_mutex);
+
+    std::ofstream img(
+        image_path,
+        std::ios::binary | std::ios::app);
+
+    if (!img) {
+        std::cerr << "Ошибка открытия образа\n";
+        return;
+    }
+
+    add_file_to_image(
+        img,
+        real_path,
+        stored_name,
+        key
+    );
+}
+
+
+// Обработка -add
+void handle_add(int argc, char* argv[]) {
+
+    std::string key;
+    std::string image_path;
+
+    std::vector<std::string> input_paths;
+
+    for (int i = 2; i < argc; i++) {
+
+        std::string arg = argv[i];
+
+        if (arg == "-key" && i + 1 < argc) {
+            key = argv[++i];
+        }
+        else if (arg == "-image" && i + 1 < argc) {
+            image_path = argv[++i];
+        }
+        else {
+            input_paths.push_back(arg);
+        }
+    }
+
+    if (key.empty() || image_path.empty()) {
+        std::cerr << "Недостаточно параметров\n";
+        return;
+    }
+
+    std::vector<std::pair<std::string,std::string>> all_files;
+
+    // Сбор всех файлов
+    for (const auto& p : input_paths) {
+        collect_files(p, p, all_files);
+    }
+
+    std::vector<std::thread> threads;
+
+    for (const auto& f : all_files) {
+
+        threads.emplace_back(
+            threaded_add,
+            image_path,
+            f.first,
+            f.second,
+            key
+        );
+
+        // максимум 5 потоков
+        if (threads.size() >= MAX_WORKERS) {
+
+            for (auto& t : threads)
+                t.join();
+
+            threads.clear();
+        }
+    }
+
+    // ожидание оставшихся потоков
+    for (auto& t : threads)
+        t.join();
+}
+
+
+
+// -list
+void handle_list(const std::string& image_path) {
+    std::ifstream img(image_path, std::ios::binary);
+
+    if (!img) {
+        std::cerr << "Не удалось открыть образ\n";
+        return;
+    }
+
+    std::vector<std::pair<std::string, uint32_t>> files;
+
+    while (true) {
+        uint32_t len_data = 0;
+        uint32_t len_name = 0;
+
+        if (!img.read(reinterpret_cast<char*>(&len_data), 4))
+            break;
+
+        if (!img.read(reinterpret_cast<char*>(&len_name), 4))
+            break;
+
+        // Проверка повреждённого контейнера
+        if (len_name > 4096 || len_data > 1024 * 1024 * 1024) {
+            std::cerr << "Повреждённый контейнер\n";
+            return;
+        }
+
+        unsigned char salt[16];
+        img.read(reinterpret_cast<char*>(salt), 16);
+
+        std::string name(len_name, '\0');
+        img.read(name.data(), len_name);
+        if (!img) {
+            std::cerr << "Ошибка чтения образа\n";
+            return;
+        }
+
+        img.seekg(len_data, std::ios::cur);
+
+        files.push_back({name, len_data});
+    }
+
+    std::sort(files.begin(), files.end());
+
+    for (const auto& f : files) {
+        std::cout << f.first
+                  << " (" << f.second << " байт)\n";
+    }
+}
+
+
+
+// -get
+void handle_get(int argc, char* argv[]) {
+    std::string key, image_path, out_file, target_name;
+
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-key" && i+1 < argc)      key = argv[++i];
+        else if (arg == "-image" && i+1 < argc) image_path = argv[++i];
+        else if (arg == "-out" && i+1 < argc)  out_file = argv[++i];
+        else if (target_name.empty()) {
+            target_name = argv[i];   // имя файла внутри образа
+        }
+    }
+
+    if (key.empty() || image_path.empty() || out_file.empty() || target_name.empty()) {
+        std::cerr << "Ошибка: используйте формат:\n"
+                  << "./secure_copy -get -image disk.img -key \"secret\" -out result.txt \"filename\"\n";
+        return;
+    }
+
+    std::ifstream img(image_path, std::ios::binary);
+    if (!img) {
+        std::cerr << "Не удалось открыть образ: " << image_path << std::endl;
+        return;
+    }
+
+    bool found = false;
+    while (true) {
+        uint32_t len_data = 0, len_name = 0;
+        if (!img.read(reinterpret_cast<char*>(&len_data), 4)) break;
+        img.read(reinterpret_cast<char*>(&len_name), 4);
+
+        unsigned char salt[16];
+        img.read(reinterpret_cast<char*>(salt), 16);
+
+        std::string name(len_name, '\0');
+        img.read(name.data(), len_name);
+        if (!img) {
+            std::cerr << "Повреждённый образ\n";
+            return;
+        }
+
+        if (name == target_name) {
+            found = true;
+            
+            // Формируем ключ = master_key + salt
+            std::string full_key = key;
+            full_key.append(reinterpret_cast<char*>(salt), 16);
+
+            RC4_State state{};
+            p_rc4_init(&state, (const unsigned char*)full_key.data(), full_key.size());
+
+            std::vector<unsigned char> encrypted(len_data);
+            img.read(reinterpret_cast<char*>(encrypted.data()), len_data);
+
+            std::vector<unsigned char> decrypted(len_data);
+            p_rc4_crypt(&state, encrypted.data(), decrypted.data(), len_data);
+            p_rc4_cleanup(&state);
+
+            // Записываем расшифрованный файл
+            std::ofstream out(out_file, std::ios::binary);
+            if (out) {
+                out.write(reinterpret_cast<char*>(decrypted.data()), len_data);
+                std::cout << "Файл успешно извлечён: " << out_file 
+                          << " (" << len_data << " байт)" << std::endl;
+            } else {
+                std::cerr << "Ошибка записи в " << out_file << std::endl;
+            }
+            break;
+        } else {
+            // Пропускаем данные файла
+            img.seekg(len_data, std::ios::cur);
+        }
+    }
+
+    if (!found) {
+        std::cerr << "Файл '" << target_name << "' не найден в образе.\n";
+    }
+}
+
+
+// Главная новая функция
+int handle_secure_container_mode(int argc, char* argv[]) {
+    if (argc < 3) {
+        std::cerr << "Недостаточно аргументов\n";
+        return 1;
+    }
+
+    lib_handle = dlopen("./libcaesar.so", RTLD_LAZY);
+    if (!lib_handle) {
+        std::cerr << "dlopen failed: " << dlerror() << std::endl;
+        return 1;
+    }
+
+    p_rc4_init = (rc4_init_func)dlsym(lib_handle, "rc4_init");
+    p_rc4_crypt = (rc4_crypt_func)dlsym(lib_handle, "rc4_crypt");
+    p_rc4_cleanup = (rc4_cleanup_func)dlsym(lib_handle, "rc4_cleanup");
+
+    if (!p_rc4_init || !p_rc4_crypt || !p_rc4_cleanup) {
+        std::cerr << "dlsym RC4 failed\n";
+        dlclose(lib_handle);
+        return 1;
+    }
+
+    std::string mode = argv[1];
+
+    if (mode == "-add") {
+        handle_add(argc, argv);
+    } 
+    else if (mode == "-list") {
+        if (argc > 3) handle_list(argv[3]);  // -image ...
+        else std::cerr << "Укажите -image\n";
+    } 
+    else if (mode == "-get") {
+        handle_get(argc, argv);
+    }
+
+    if (lib_handle) dlclose(lib_handle);
+    return 0;
+}
+
+
+
