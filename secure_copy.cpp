@@ -24,6 +24,7 @@
 
 #define BLOCK_SIZE 8192
 #define MAX_WORKERS 5
+#define CHUNK_SIZE (64 * 1024)   // 64 КБ — размер чанка для шифрования по кусочкам
 
 // Прототипы функций для защищённой памяти
 bool init_secure_key();
@@ -54,7 +55,8 @@ void handle_sigint(int) {
 void* secure_key_mem = nullptr;
 const size_t KEY_SIZE = 16;
 
-// Инициализация защищённой памяти под ключ
+// Инициализация защищённой памяти под ключэ
+//Выделяет 16 байт анонимной памяти с правами чтения+записи.
 bool init_secure_key() {
     secure_key_mem = mmap(NULL, KEY_SIZE, PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -66,6 +68,7 @@ bool init_secure_key() {
 }
 
 // Установка ключа в защищённую память
+//Временно снимает защиту, записывает ключ, снова ставит только чтение.
 bool set_secure_key(char key_char) {
     if (!secure_key_mem) return false;
 
@@ -84,6 +87,7 @@ bool set_secure_key(char key_char) {
 }
 
 // Получение копии ключа для использования
+//Временно снимает защиту, читает ключ, снова защищает.
 char get_secure_key() {
     if (!secure_key_mem) return 0;
 
@@ -94,6 +98,7 @@ char get_secure_key() {
 }
 
 // Очистка защищённой памяти
+//Затирает ключ нулями и освобождает память.
 void cleanup_secure_key() {
     if (secure_key_mem) {
         mprotect(secure_key_mem, KEY_SIZE, PROT_READ | PROT_WRITE);
@@ -104,12 +109,58 @@ void cleanup_secure_key() {
 }
 
 // Теперь обработчик может использовать cleanup_secure_key()
+//Обработчик ошибки сегментации. Если кто-то попробует записать в защищённую память — программа красиво завершится.
 void segfault_handler(int /*sig*/, siginfo_t* info, void* /*ucontext*/) {
     std::cerr << "\n[SECURITY ERROR] Segmentation fault! Attempted write to protected key memory.\n";
     std::cerr << "Address: " << info->si_addr << std::endl;
     cleanup_secure_key();
     exit(2);
 }
+
+
+
+//  ЗАЩИЩЁННОЕ СОСТОЯНИЕ RC4 (S-box) 
+struct RC4_State {
+    unsigned char S[256];
+    int i, j;
+};
+
+// Выделение защищённой памяти под состояние RC4
+RC4_State* create_secure_rc4_state() {
+    RC4_State* state = (RC4_State*)mmap(NULL, sizeof(RC4_State),
+                                        PROT_READ | PROT_WRITE,
+                                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (state == MAP_FAILED) {
+        std::cerr << "mmap для RC4_State failed\n";
+        return nullptr;
+    }
+    return state;
+}
+
+// Перевод S-box в режим "только чтение"
+bool protect_rc4_state(RC4_State* state) {
+    if (!state) return false;
+    return mprotect(state, sizeof(RC4_State), PROT_READ) == 0;
+}
+
+// Временное разрешение записи (для шифрования)
+bool unprotect_rc4_state(RC4_State* state) {
+    if (!state) return false;
+    return mprotect(state, sizeof(RC4_State), PROT_READ | PROT_WRITE) == 0;
+}
+
+// Очистка и освобождение памяти
+void destroy_secure_rc4_state(RC4_State* state) {
+    if (state) {
+        unprotect_rc4_state(state);        // сначала разрешаем запись
+        memset(state, 0, sizeof(RC4_State)); // затираем
+        munmap(state, sizeof(RC4_State));   // освобождаем
+    }
+}
+
+
+
+
 
 
 typedef void (*set_key_func)(char);
@@ -147,10 +198,6 @@ pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 
 
-struct RC4_State {
-    unsigned char S[256];
-    int i, j;
-};
 
 struct ThreadArgs {
     set_key_func set_key;
@@ -407,90 +454,101 @@ void collect_files(const std::string& path,
                    std::vector<std::pair<std::string,std::string>>& files)
 {
     namespace fs = std::filesystem;
-
     try {
         if (fs::is_regular_file(path)) {
+            std::string relative;
 
-            std::string relative =
-                fs::relative(path, base_dir).string();
+            // ← ИСПРАВЛЕНИЕ: специальная обработка одиночного файла
+            if (fs::equivalent(path, base_dir) || path == base_dir) {
+                // Если добавляется один файл — берём только его имя
+                relative = fs::path(path).filename().string();
+            } else {
+                // Если файл внутри директории — вычисляем относительный путь
+                relative = fs::relative(path, base_dir).string();
+            }
 
-            files.push_back({path, relative});
+            files.emplace_back(path, relative);
             return;
         }
 
+        // Если это директория — рекурсивно обходим
         if (fs::is_directory(path)) {
-
-            for (const auto& entry :
-                 fs::recursive_directory_iterator(path)) {
-
+            for (const auto& entry : fs::recursive_directory_iterator(path)) {
                 if (entry.is_regular_file()) {
-
-                    std::string relative =
-                        fs::relative(entry.path(), base_dir).string();
-
-                    files.push_back({
-                        entry.path().string(),
-                        relative
-                    });
+                    std::string relative = fs::relative(entry.path(), base_dir).string();
+                    files.emplace_back(entry.path().string(), relative);
                 }
             }
         }
-
     } catch (const std::exception& e) {
-        std::cerr << "Ошибка обхода: "
-                  << e.what() << std::endl;
+        std::cerr << "Ошибка обхода " << path << ": " << e.what() << std::endl;
     }
 }
 
 
-// Запись одного файла в образ
-void add_file_to_image(std::ofstream& img, const std::string& real_path, const std::string& stored_name,const std::string& master_key) {
-    std::ifstream file(real_path, std::ios::binary | std::ios::ate);
+
+
+
+// Запись одного файла в образ (с защитой S-box и по кусочкам)
+void add_file_to_image(std::ofstream& img, 
+                       const std::string& real_path, 
+                       const std::string& stored_name,
+                       const std::string& master_key) {
+    std::ifstream file(real_path, std::ios::binary);
     if (!file) {
-        std::cerr << "Ошибка открытия: " << real_path << std::endl;
+        std::cerr << "Ошибка открытия файла: " << real_path << std::endl;
         return;
     }
-
-    std::streamsize size = file.tellg();
-
-    if (size < 0) {
-        std::cerr << "Ошибка размера файла: " << real_path << std::endl;
-        return;
-    }
-
-    file.seekg(0, std::ios::beg);
-
-    std::vector<char> data(size);
-    file.read(data.data(), size);
 
     // Генерация соли
     unsigned char salt[16] = {0};
     std::random_device rd;
-    for (int i = 0; i < 16; i++) salt[i] = rd() % 256;
+    for (int i = 0; i < 16; i++) {
+        salt[i] = rd() % 256;
+    }
 
-    // Ключ = master_key + salt
-
+    // Полный ключ = master_key + salt
     std::string full_key = master_key;
     full_key.append(reinterpret_cast<char*>(salt), 16);
 
-    RC4_State state;
-    p_rc4_init(&state, (const unsigned char*)full_key.data(), full_key.size());
+    // Создаём защищённое состояние RC4
+    RC4_State* state = create_secure_rc4_state();
+    if (!state) return;
 
-    std::vector<unsigned char> encrypted(size);
-    p_rc4_crypt(&state, (const unsigned char*)data.data(), encrypted.data(), size);
-    p_rc4_cleanup(&state);
+    unprotect_rc4_state(state);                    // разрешаем запись
+    p_rc4_init(state, (const unsigned char*)full_key.data(), full_key.size());
+    protect_rc4_state(state);                      // снова защищаем
 
-    // Запись блока
-    uint32_t len_data = static_cast<uint32_t>(size);
+    // Записываем заголовок
+    file.seekg(0, std::ios::end);
+    uint32_t len_data = static_cast<uint32_t>(file.tellg());
+    file.seekg(0, std::ios::beg);
+
     uint32_t len_name = static_cast<uint32_t>(stored_name.length());
 
     img.write(reinterpret_cast<char*>(&len_data), 4);
     img.write(reinterpret_cast<char*>(&len_name), 4);
     img.write(reinterpret_cast<char*>(salt), 16);
     img.write(stored_name.c_str(), len_name);
-    img.write(reinterpret_cast<char*>(encrypted.data()), size);
-}
 
+    // Шифрование ПО КУСОЧКАМ
+    std::vector<unsigned char> buffer(CHUNK_SIZE);
+    while (true) {
+        file.read(reinterpret_cast<char*>(buffer.data()), CHUNK_SIZE);
+        size_t bytes_read = file.gcount();
+        if (bytes_read == 0) break;
+
+        unprotect_rc4_state(state);
+        p_rc4_crypt(state, buffer.data(), buffer.data(), static_cast<int>(bytes_read));
+        protect_rc4_state(state);
+
+        img.write(reinterpret_cast<char*>(buffer.data()), bytes_read);
+    }
+
+    destroy_secure_rc4_state(state);   // очистка + munmap
+
+    std::cout << "Добавлен файл: " << stored_name << " (" << len_data << " байт)" << std::endl;
+}
 
 
 // Поточная функция
@@ -502,22 +560,19 @@ void threaded_add(
 {
     std::lock_guard<std::mutex> lock(image_mutex);
 
-    std::ofstream img(
-        image_path,
-        std::ios::binary | std::ios::app);
-
+    // Открываем файл с флагом app И create (чтобы создавался, если не существует)
+    std::ofstream img(image_path, std::ios::binary | std::ios::app | std::ios::out);
+    
     if (!img) {
-        std::cerr << "Ошибка открытия образа\n";
+        std::cerr << "Ошибка открытия/создания образа: " << image_path << std::endl;
         return;
     }
 
-    add_file_to_image(
-        img,
-        real_path,
-        stored_name,
-        key
-    );
+    add_file_to_image(img, real_path, stored_name, key);
 }
+
+
+
 
 
 // Обработка -add
@@ -525,13 +580,10 @@ void handle_add(int argc, char* argv[]) {
 
     std::string key;
     std::string image_path;
-
     std::vector<std::string> input_paths;
 
     for (int i = 2; i < argc; i++) {
-
         std::string arg = argv[i];
-
         if (arg == "-key" && i + 1 < argc) {
             key = argv[++i];
         }
@@ -543,43 +595,44 @@ void handle_add(int argc, char* argv[]) {
         }
     }
 
-    if (key.empty() || image_path.empty()) {
+    if (key.empty() || image_path.empty() || input_paths.empty()) {
         std::cerr << "Недостаточно параметров\n";
         return;
     }
 
+    // Важно: создаём файл, если его нет
+    {
+        std::ofstream test(image_path, std::ios::app);
+        if (!test) {
+            std::cerr << "Не удалось создать файл образа: " << image_path << std::endl;
+            return;
+        }
+    }
+
     std::vector<std::pair<std::string,std::string>> all_files;
 
-    // Сбор всех файлов
     for (const auto& p : input_paths) {
         collect_files(p, p, all_files);
     }
 
+    if (all_files.empty()) {
+        std::cout << "Не найдено файлов для добавления\n";
+        return;
+    }
+
     std::vector<std::thread> threads;
-
     for (const auto& f : all_files) {
+        threads.emplace_back(threaded_add, image_path, f.first, f.second, key);
 
-        threads.emplace_back(
-            threaded_add,
-            image_path,
-            f.first,
-            f.second,
-            key
-        );
-
-        // максимум 5 потоков
         if (threads.size() >= MAX_WORKERS) {
-
-            for (auto& t : threads)
-                t.join();
-
+            for (auto& t : threads) t.join();
             threads.clear();
         }
     }
 
-    // ожидание оставшихся потоков
-    for (auto& t : threads)
-        t.join();
+    for (auto& t : threads) t.join();
+
+    std::cout << "Добавлено файлов: " << all_files.size() << std::endl;
 }
 
 
@@ -639,26 +692,22 @@ void handle_list(const std::string& image_path) {
 // -get
 void handle_get(int argc, char* argv[]) {
     std::string key, image_path, out_file, target_name;
-
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-key" && i+1 < argc)      key = argv[++i];
+        if (arg == "-key" && i+1 < argc) key = argv[++i];
         else if (arg == "-image" && i+1 < argc) image_path = argv[++i];
-        else if (arg == "-out" && i+1 < argc)  out_file = argv[++i];
-        else if (target_name.empty()) {
-            target_name = argv[i];   // имя файла внутри образа
-        }
+        else if (arg == "-out" && i+1 < argc) out_file = argv[++i];
+        else if (target_name.empty()) target_name = argv[i];
     }
 
     if (key.empty() || image_path.empty() || out_file.empty() || target_name.empty()) {
-        std::cerr << "Ошибка: используйте формат:\n"
-                  << "./secure_copy -get -image disk.img -key \"secret\" -out result.txt \"filename\"\n";
+        std::cerr << "Ошибка параметров -get\n";
         return;
     }
 
     std::ifstream img(image_path, std::ios::binary);
     if (!img) {
-        std::cerr << "Не удалось открыть образ: " << image_path << std::endl;
+        std::cerr << "Не удалось открыть образ\n";
         return;
     }
 
@@ -673,46 +722,62 @@ void handle_get(int argc, char* argv[]) {
 
         std::string name(len_name, '\0');
         img.read(name.data(), len_name);
-        if (!img) {
-            std::cerr << "Повреждённый образ\n";
-            return;
-        }
 
         if (name == target_name) {
             found = true;
-            
-            // Формируем ключ = master_key + salt
+
             std::string full_key = key;
             full_key.append(reinterpret_cast<char*>(salt), 16);
 
-            RC4_State state{};
-            p_rc4_init(&state, (const unsigned char*)full_key.data(), full_key.size());
-
-            std::vector<unsigned char> encrypted(len_data);
-            img.read(reinterpret_cast<char*>(encrypted.data()), len_data);
-
-            std::vector<unsigned char> decrypted(len_data);
-            p_rc4_crypt(&state, encrypted.data(), decrypted.data(), len_data);
-            p_rc4_cleanup(&state);
-
-            // Записываем расшифрованный файл
-            std::ofstream out(out_file, std::ios::binary);
-            if (out) {
-                out.write(reinterpret_cast<char*>(decrypted.data()), len_data);
-                std::cout << "Файл успешно извлечён: " << out_file 
-                          << " (" << len_data << " байт)" << std::endl;
-            } else {
-                std::cerr << "Ошибка записи в " << out_file << std::endl;
+            RC4_State* state = create_secure_rc4_state();
+            if (!state) {
+                std::cerr << "Не удалось создать состояние RC4\n";
+                break;
             }
+
+            unprotect_rc4_state(state);
+            p_rc4_init(state, (const unsigned char*)full_key.data(), full_key.size());
+            protect_rc4_state(state);
+
+            std::ofstream out(out_file, std::ios::binary);
+            if (!out) {
+                std::cerr << "Ошибка создания выходного файла\n";
+                destroy_secure_rc4_state(state);
+                break;
+            }
+
+            std::vector<unsigned char> buffer(CHUNK_SIZE);
+            uint32_t remaining = len_data;
+
+            while (remaining > 0) {
+                size_t to_read = std::min(static_cast<size_t>(CHUNK_SIZE), 
+                                         static_cast<size_t>(remaining));
+                
+                img.read(reinterpret_cast<char*>(buffer.data()), to_read);
+                size_t bytes_read = img.gcount();
+
+                if (bytes_read == 0) break;
+
+                unprotect_rc4_state(state);
+                p_rc4_crypt(state, buffer.data(), buffer.data(), static_cast<int>(bytes_read));
+                protect_rc4_state(state);
+
+                out.write(reinterpret_cast<char*>(buffer.data()), bytes_read);
+                remaining -= bytes_read;
+            }
+
+            destroy_secure_rc4_state(state);
+            std::cout << "Файл успешно извлечён: " << out_file 
+                      << " (" << len_data << " байт)\n";
             break;
-        } else {
-            // Пропускаем данные файла
+        } 
+        else {
             img.seekg(len_data, std::ios::cur);
         }
     }
 
     if (!found) {
-        std::cerr << "Файл '" << target_name << "' не найден в образе.\n";
+        std::cerr << "Файл '" << target_name << "' не найден.\n";
     }
 }
 
